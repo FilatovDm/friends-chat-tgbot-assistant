@@ -1,0 +1,9 @@
+.env
+bot/.env
+bot/bot.log
+bot/threads.sqlite3
+venv/
+bot/venv/
+__pycache__/
+*.py[cod]
+*.pyo
