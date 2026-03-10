@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass
-
-from duckduckgo_search import DDGS
 from openai import APITimeoutError, AsyncOpenAI
 
 from database import ThreadDatabase
@@ -40,29 +37,7 @@ class OpenAIAssistantService:
         """Best effort: ensure assistant temperature/tools/tool_resources are set."""
         payload: dict[str, object] = {
             "temperature": self._config.temperature,
-            "tools": [
-                {"type": "file_search"},
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "web_search",
-                        "description": (
-                            "Search the internet for current information: "
-                            "weather, news, facts, prices, anything requiring up-to-date data"
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "Search query in Russian or English",
-                                }
-                            },
-                            "required": ["query"],
-                        },
-                    },
-                },
-            ],
+            "tools": [{"type": "file_search"}],
         }
         if self._config.vector_store_id:
             payload["tool_resources"] = {
@@ -146,24 +121,9 @@ class OpenAIAssistantService:
                 raise AssistantRunFailedError(message)
 
             if status == "requires_action":
-                tool_calls = run.required_action.submit_tool_outputs.tool_calls
-                tool_outputs = []
-                for tc in tool_calls:
-                    if tc.function.name == "web_search":
-                        args = json.loads(tc.function.arguments)
-                        result = await _run_web_search(args["query"])
-                        tool_outputs.append(
-                            {
-                                "tool_call_id": tc.id,
-                                "output": result,
-                            }
-                        )
-                await self._client.beta.threads.runs.submit_tool_outputs(
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    tool_outputs=tool_outputs,
+                raise AssistantRunFailedError(
+                    "Run requires_action but no function-calling handler is configured."
                 )
-                continue
 
             await asyncio.sleep(self._config.poll_interval_seconds)
 
@@ -188,25 +148,7 @@ class OpenAIAssistantService:
             if text_parts:
                 return "\n".join(text_parts).strip()
 
-        return "что-то пошло не так, повтори позже."
-
-
-async def _run_web_search(query: str) -> str:
-    loop = asyncio.get_event_loop()
-
-    def search() -> str:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
-
-        if not results:
-            return "Ничего не нашёл."
-
-        parts: list[str] = []
-        for r in results:
-            parts.append(f"{r['title']}\n{r['body']}\n{r['href']}")
-        return "\n\n".join(parts)
-
-    return await loop.run_in_executor(None, search)
+        return "I couldn't produce a text response this time."
 
 
 __all__ = [
