@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -104,14 +104,24 @@ def _parse_news_chat_ids(raw: str | None) -> list[int]:
     return ids
 
 
-async def _daily_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_ids: list[int] = context.application.bot_data.get("news_chat_ids", [])
+def _load_timezone(name: str | None) -> ZoneInfo | None:
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        logger.warning("Не удалось загрузить таймзону %s, использую локальное время.", name)
+        return None
+
+
+async def _send_news(application: Application) -> None:
+    chat_ids = application.bot_data.get("news_chat_ids", [])
     if not chat_ids:
         return
 
-    service: OpenAIAssistantService = context.application.bot_data["assistant_service"]
-    db: ThreadDatabase = context.application.bot_data["thread_db"]
-    prompt: str = context.application.bot_data["news_prompt"]
+    service: OpenAIAssistantService = application.bot_data["assistant_service"]
+    db: ThreadDatabase = application.bot_data["thread_db"]
+    prompt: str = application.bot_data["news_prompt"]
 
     for chat_id in chat_ids:
         try:
@@ -121,30 +131,42 @@ async def _daily_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         try:
-            await context.bot.send_message(chat_id=chat_id, text=summary)
+            await application.bot.send_message(chat_id=chat_id, text=summary)
         except Exception:
             logger.exception("Не удалось отправить обзор в чат %s", chat_id)
 
 
-def _schedule_daily_news(application: Application) -> None:
-    chat_ids: list[int] = application.bot_data.get("news_chat_ids", [])
+async def _news_scheduler(application: Application) -> None:
+    chat_ids = application.bot_data.get("news_chat_ids", [])
     if not chat_ids:
         return
 
-    tz_name: str = application.bot_data.get("news_timezone", "")
-    tzinfo = None
-    if tz_name:
-        try:
-            tzinfo = ZoneInfo(tz_name)
-        except Exception:
-            logger.warning("Не удалось загрузить таймзону %s, использую локальное время.", tz_name)
-    news_time = dt_time(hour=9, minute=0, tzinfo=tzinfo)
-    application.job_queue.run_daily(
-        _daily_news_job,
-        news_time,
-        name="daily_news",
-    )
-    logger.info("Ежедневный новостной обзор запланирован на %s в %s.", chat_ids, tz_name or "local")
+    news_time: dt_time = application.bot_data.get("news_time", dt_time(hour=9, minute=0))
+    tzinfo: ZoneInfo | None = application.bot_data.get("news_timezone_info")
+
+    while True:
+        now = datetime.now(tzinfo)
+        target = now.replace(
+            hour=news_time.hour,
+            minute=news_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        await _send_news(application)
+
+
+def _start_news_scheduler(application: Application) -> None:
+    task = application.bot_data.get("news_scheduler_task")
+    if task:
+        return
+
+    scheduler = asyncio.create_task(_news_scheduler(application))
+    application.bot_data["news_scheduler_task"] = scheduler
 
 
 async def _typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, task: asyncio.Task[str]) -> None:
@@ -237,7 +259,7 @@ async def post_init(application: Application) -> None:
     service: OpenAIAssistantService = application.bot_data["assistant_service"]
     await service.configure_assistant()
 
-    _schedule_daily_news(application)
+    _start_news_scheduler(application)
 
     logger.info(
         "Bot initialized. bot_id=%s, username=@%s",
@@ -261,6 +283,7 @@ def main() -> None:
         "Составь короткий утренний обзор новостей (политика, экономика, технологии) в 3–4 пунктах.",
     )
     news_timezone = os.getenv("NEWS_TIMEZONE", "Europe/Moscow")
+    news_timezone_info = _load_timezone(news_timezone)
 
     db = ThreadDatabase(DB_PATH)
     service = OpenAIAssistantService(
@@ -279,6 +302,9 @@ def main() -> None:
     app.bot_data["assistant_service"] = service
     app.bot_data["news_chat_ids"] = news_chat_ids
     app.bot_data["news_prompt"] = news_prompt
+    app.bot_data["news_timezone"] = news_timezone
+    app.bot_data["news_timezone_info"] = news_timezone_info
+    app.bot_data["news_time"] = dt_time(hour=9, minute=0)
     app.bot_data["news_timezone"] = news_timezone
 
     app.add_handler(
