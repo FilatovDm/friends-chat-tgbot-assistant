@@ -8,6 +8,7 @@ import re
 from collections.abc import Awaitable
 from pathlib import Path
 
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import MessageEntity, Update
 from telegram.constants import ChatAction
@@ -126,6 +127,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     prompt = strip_bot_mention(message.text, bot_username=bot_username)
+    today = datetime.now().strftime("%d.%m.%Y")
+    prompt = f"Сегодня {today}: {prompt}"
     if not prompt:
         await message.reply_text("напиши хоть что-то после упоминания, а не пустоту.")
         return
