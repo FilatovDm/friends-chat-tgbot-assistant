@@ -6,7 +6,9 @@ import logging
 import os
 import re
 from collections.abc import Awaitable
+from datetime import datetime, time as dt_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from datetime import datetime
 from dotenv import load_dotenv
@@ -85,6 +87,64 @@ def strip_bot_mention(text: str, bot_username: str) -> str:
         return text.strip()
     pattern = re.compile(rf"@{re.escape(bot_username)}", re.IGNORECASE)
     return pattern.sub("", text).strip()
+
+
+def _parse_news_chat_ids(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    ids: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            logger.warning("Не могу распознать chat_id %r, пропускаю.", part)
+    return ids
+
+
+async def _daily_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_ids: list[int] = context.application.bot_data.get("news_chat_ids", [])
+    if not chat_ids:
+        return
+
+    service: OpenAIAssistantService = context.application.bot_data["assistant_service"]
+    db: ThreadDatabase = context.application.bot_data["thread_db"]
+    prompt: str = context.application.bot_data["news_prompt"]
+
+    for chat_id in chat_ids:
+        try:
+            summary = await service.ask(chat_id=chat_id, user_text=prompt, db=db)
+        except Exception:
+            logger.exception("Не удалось собрать обзор для чата %s", chat_id)
+            continue
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=summary)
+        except Exception:
+            logger.exception("Не удалось отправить обзор в чат %s", chat_id)
+
+
+def _schedule_daily_news(application: Application) -> None:
+    chat_ids: list[int] = application.bot_data.get("news_chat_ids", [])
+    if not chat_ids:
+        return
+
+    tz_name: str = application.bot_data.get("news_timezone", "")
+    tzinfo = None
+    if tz_name:
+        try:
+            tzinfo = ZoneInfo(tz_name)
+        except Exception:
+            logger.warning("Не удалось загрузить таймзону %s, использую локальное время.", tz_name)
+    news_time = dt_time(hour=9, minute=0, tzinfo=tzinfo)
+    application.job_queue.run_daily(
+        _daily_news_job,
+        news_time,
+        name="daily_news",
+    )
+    logger.info("Ежедневный новостной обзор запланирован на %s в %s.", chat_ids, tz_name or "local")
 
 
 async def _typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, task: asyncio.Task[str]) -> None:
@@ -177,6 +237,8 @@ async def post_init(application: Application) -> None:
     service: OpenAIAssistantService = application.bot_data["assistant_service"]
     await service.configure_assistant()
 
+    _schedule_daily_news(application)
+
     logger.info(
         "Bot initialized. bot_id=%s, username=@%s",
         bot_user.id,
@@ -193,6 +255,12 @@ def main() -> None:
     openai_api_key = _require_env("OPENAI_API_KEY")
     assistant_id = _require_env("OPENAI_ASSISTANT_ID")
     vector_store_id = os.getenv("OPENAI_VECTOR_STORE_ID")
+    news_chat_ids = _parse_news_chat_ids(os.getenv("NEWS_CHAT_IDS"))
+    news_prompt = os.getenv(
+        "NEWS_PROMPT",
+        "Составь короткий утренний обзор новостей (политика, экономика, технологии) в 3–4 пунктах.",
+    )
+    news_timezone = os.getenv("NEWS_TIMEZONE", "Europe/Moscow")
 
     db = ThreadDatabase(DB_PATH)
     service = OpenAIAssistantService(
@@ -209,6 +277,9 @@ def main() -> None:
     app = Application.builder().token(telegram_token).post_init(post_init).build()
     app.bot_data["thread_db"] = db
     app.bot_data["assistant_service"] = service
+    app.bot_data["news_chat_ids"] = news_chat_ids
+    app.bot_data["news_prompt"] = news_prompt
+    app.bot_data["news_timezone"] = news_timezone
 
     app.add_handler(
         MessageHandler(
